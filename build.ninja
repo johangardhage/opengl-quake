@@ -1,0 +1,15 @@
+ninja_required_version = 1.5
+
+cc = g++
+cflags = -Wall -s -march=native `sdl2-config --cflags`
+libs = `sdl2-config --libs` `pkg-config --libs glu`
+builddir = build
+srcdir = src
+
+rule cc
+  command = $cc $cflags $in $libs -o $out
+  description = Building executable $out
+
+build $builddir/quake: cc $srcdir/Quake.cpp $srcdir/World.cpp $srcdir/Map.cpp $srcdir/Camera.cpp
+
+build quake: phony $builddir/quake

@@ -13,11 +13,19 @@
 
 #define MOVEMENT_SPEED 5.0
 
+// The "+0".."+N" animation sequence of a texture, owned by its "+0" frame
+struct TextureAnim
+{
+	int total = 0;		// Number of frames in the sequence (0/1 = not animated)
+	int frames[10];		// Texture index of each animation frame, or -1
+};
+
 // Everything derived from one BSP texture: its OpenGL objects and classification flags
 struct Texture
 {
 	unsigned int objName = 0;		// OpenGL texture object name
 	unsigned int lumaObjName = 0;	// OpenGL luma (fullbright overlay) texture object name
+	TextureAnim anim;				// "+0".."+N" animation sequence
 	bool hasLuma = false;			// True if texture has fullbright pixels
 };
 
@@ -44,6 +52,7 @@ struct World
 	double lightStyleTime = 0.0;			// Time accumulator for light styles
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	int numTextures = 0;					// Number of OpenGL texture objects
+	double textureTime = 0.0;				// Accumulated time driving texture animation
 };
 
 World world;
@@ -218,6 +227,103 @@ void RebuildLightmap(World *world, int surface)
 
 	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_LUMINANCE, GL_UNSIGNED_BYTE, luxels);
 	delete[] luxels;
+}
+
+//
+// Frame number 0-9 of a "+N..." animated texture, or -1 if it is not animated
+//
+int TextureAnimationFrame(const char *name)
+{
+	if (!name || name[0] != '+') {
+		return -1;
+	}
+	if (name[1] >= '0' && name[1] <= '9') {
+		return name[1] - '0';
+	}
+	return -1;
+}
+
+//
+// True if two "+" animated texture names belong to the same sequence
+// (identical past the leading "+N" frame marker)
+//
+bool IsSameTextureAnimation(const char *a, const char *b)
+{
+	if (!a || !b || a[0] != '+' || b[0] != '+') {
+		return false;
+	}
+	for (int i = 2; i < 16; i++) {
+		if (a[i] != b[i]) {
+			return false;
+		}
+		if (a[i] == '\0') {
+			return true;
+		}
+	}
+	return true;
+}
+
+//
+// Collect the "+0".."+9" frames of each texture animation into its "+0" texture
+//
+bool BuildTextureAnimations(World *world)
+{
+	for (int i = 0; i < world->numTextures; i++) {
+		world->textures[i].anim.total = 0;
+		for (int frame = 0; frame < 10; frame++) {
+			world->textures[i].anim.frames[frame] = -1;
+		}
+	}
+
+	for (int i = 0; i < world->numTextures; i++) {
+		miptex_t *baseTexture = world->map.getMipTexture(i);
+		if (!baseTexture) {
+			continue;
+		}
+		// Only the "+0" texture of a sequence owns the frame list
+		if (TextureAnimationFrame(baseTexture->name) != 0) {
+			continue;
+		}
+
+		TextureAnim *anim = &world->textures[i].anim;
+		for (int j = 0; j < world->numTextures; j++) {
+			miptex_t *frameTexture = world->map.getMipTexture(j);
+			if (!frameTexture || !IsSameTextureAnimation(baseTexture->name, frameTexture->name)) {
+				continue;
+			}
+			int frame = TextureAnimationFrame(frameTexture->name);
+			if (frame >= 0 && frame < 10) {
+				anim->frames[frame] = j;
+				if (frame + 1 > anim->total) {
+					anim->total = frame + 1;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+//
+// Resolve a texture index to its current animation frame for this render time
+//
+int ResolveTextureAnimation(World *world, int textureIndex)
+{
+	TextureAnim *anim = &world->textures[textureIndex].anim;
+	if (anim->total <= 1) {
+		return textureIndex;
+	}
+
+	// Textures animate at 10 frames per second
+	int frame = ((int)(world->textureTime * 10.0)) % anim->total;
+	int resolved = anim->frames[frame];
+	if (resolved < 0) {
+		resolved = anim->frames[0];
+	}
+	if (resolved < 0 || resolved >= world->numTextures) {
+		return textureIndex;
+	}
+	return resolved;
 }
 
 //
@@ -405,7 +511,9 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 		}
 		// Get a pointer to the texture info so we know which base texture to bind
 		texinfo_t *textureInfo = world->map.getTextureInfo(surfaceIndex);
-		Texture *texture = &world->textures[textureInfo->miptex];
+		// Resolve animated textures to their current frame
+		int textureIndex = ResolveTextureAnimation(world, textureInfo->miptex);
+		Texture *texture = &world->textures[textureIndex];
 		// Bind the base texture to unit 0 and the surface's lightmap to unit 1
 		glActiveTextureFn(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texture->objName);
@@ -555,6 +663,9 @@ void DEMO_Initialize(void)
 	if (!BuildSurfacePrimitives(&world)) {
 		RETRO_RageQuit("Unable to initialize world surfaces\n");
 	}
+	if (!BuildTextureAnimations(&world)) {
+		RETRO_RageQuit("Unable to initialize texture animations\n");
+	}
 
 	UpdateLightStyles(&world, 0.0);
 
@@ -656,6 +767,9 @@ void DEMO_Render(double deltatime)
 			camera.origin[1] + camera.forward[1],
 			camera.origin[2] + camera.forward[2],
 			camera.up[0], camera.up[1], camera.up[2]);
+
+	// Advance the clock that drives texture animation
+	world.textureTime += deltatime;
 
 	// Advance the clock that drives light style animation
 	UpdateLightStyles(&world, deltatime);

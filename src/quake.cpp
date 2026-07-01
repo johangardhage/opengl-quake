@@ -25,6 +25,10 @@ struct Texture
 struct Surface
 {
 	unsigned int lightmapObjName = 0;	// OpenGL lightmap texture object name
+	int lightmapWidth = 0;				// Lightmap width
+	int lightmapHeight = 0;				// Lightmap height
+	bool lightmapDynamic = false;		// True if the lightmap has any animating styles
+	int lightmapFrame = -1;				// Frame number of last lightmap rebuild
 };
 
 struct World
@@ -35,6 +39,9 @@ struct World
 	Texture *textures = NULL;				// Array of per-BSP-texture OpenGL state, one per BSP texture
 	Surface *surfaces = NULL;				// Array of per-surface OpenGL state, one per surface
 	int *visibleSurfaces = NULL;			// Array of visible surfaces, contains an index to the surfaces
+	int lightStyleFrame = -1;				// Current frame index of the 10Hz light animations
+	int lightStyles[64];					// Current values of the 64 light styles
+	double lightStyleTime = 0.0;			// Time accumulator for light styles
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	int numTextures = 0;					// Number of OpenGL texture objects
 };
@@ -115,6 +122,102 @@ bool UploadTextures(World *world)
 	}
 
 	return true;
+}
+
+//
+// Classic Quake light-style brightness patterns. Each character 'a'..'z' is a
+// brightness level ('a' = dark, 'm' = normal, 'z' = bright), cycled at 10 Hz.
+//
+const char *LightStylePattern(int style)
+{
+	static const char *patterns[] = {
+		"m",
+		"mmnmmommommnonmmonqnmmo",
+		"abcdefghijklmnopqrstuvwxyzyxwvutsrqponmlkjihgfedcba",
+		"mmmmmaaaaammmmmaaaaaabcdefgabcdefg",
+		"mamamamamama",
+		"jklmnopqrstuvwxyzyxwvutsrqponmlkj",
+		"nmonqnmomnmomomno",
+		"mmmaaaabcdefgmmmmaaaammmaamm",
+		"mmmaaammmaaammmabcdefaaaammmmabcdefmmmaaaa",
+		"aaaaaaaazzzzzzzz",
+		"mmamammmmammamamaaamammma",
+		"abcdefghijklmnopqrrqponmlkjihgfedcba",
+		"mmnnmmnnnmmnn",
+		"kmjmlnklkj",
+		"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmaaaaaaaazzzzzzzz",
+	};
+
+	if (style >= 0 && style < (int)(sizeof(patterns) / sizeof(patterns[0]))) {
+		return patterns[style];
+	}
+	return "m";
+}
+
+//
+// Advance classic Quake animated light style values
+//
+void UpdateLightStyles(World *world, double deltaTime)
+{
+	world->lightStyleTime += deltaTime;
+	int frame = (int)(world->lightStyleTime * 10.0);	// light styles animate at 10 Hz
+	if (frame == world->lightStyleFrame) {
+		return;
+	}
+	world->lightStyleFrame = frame;
+
+	for (int style = 0; style < 64; style++) {
+		const char *pattern = LightStylePattern(style);
+		int length = 0;
+		while (pattern[length]) {
+			length++;
+		}
+
+		// Map the current pattern letter 'a'..'z' onto a brightness scale where
+		// 'm' (== 264) is normal full-strength lighting.
+		char value = pattern[length > 0 ? frame % length : 0];
+		if (value < 'a') value = 'a';
+		if (value > 'z') value = 'z';
+		world->lightStyles[style] = ((int)value - (int)'a') * 22;
+	}
+}
+
+//
+// Rebuild a dynamic lightmap for the specified surface with the current light style values
+//
+void RebuildLightmap(World *world, int surface)
+{
+	Surface *surf = &world->surfaces[surface];
+	int width = surf->lightmapWidth;
+	int height = surf->lightmapHeight;
+
+	glBindTexture(GL_TEXTURE_2D, surf->lightmapObjName);
+
+	dface_t *face = world->map.getSurface(surface);
+	unsigned char *samples = world->map.getLightmap(face->lightofs);
+
+	if (!samples) {
+		return;
+	}
+
+	int size = width * height;
+	unsigned char *luxels = new unsigned char [size];
+	for (int i = 0; i < size; i++) {
+		float intensity = 0.0f;
+		for (int style = 0; style < MAXLIGHTMAPS && face->styles[style] != 255; style++) {
+			int styleIndex = face->styles[style];
+			float scale = 1.0f;
+			if (styleIndex < 64) {
+				scale = (float)world->lightStyles[styleIndex] / 264.0f;
+			}
+			intensity += (float)samples[style * size + i] * scale;
+		}
+		int intVal = (int)(intensity + 0.5f);
+		luxels[i] = (intVal > 255) ? 255 : (unsigned char)intVal;
+	}
+
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_LUMINANCE, GL_UNSIGNED_BYTE, luxels);
+	delete[] luxels;
 }
 
 //
@@ -243,6 +346,23 @@ bool BuildSurfacePrimitives(World *world)
 			primitives->l[1] = (primitives->l[1] - lightMinT * 16 + 8) / (lightHeight * 16.0f);
 		}
 
+		world->surfaces[i].lightmapWidth = lightWidth;
+		world->surfaces[i].lightmapHeight = lightHeight;
+
+		// Special (sky/liquid) surfaces always get BuildLightmap's 1x1 white texel,
+		// regardless of styles, so they must never be treated as dynamic.
+		dface_t *face = world->map.getSurface(i);
+		bool dynamic = false;
+		if (!(textureInfo->flags & TEX_SPECIAL)) {
+			for (int style = 0; style < MAXLIGHTMAPS && face->styles[style] != 255; style++) {
+				if (face->styles[style] > 0 && face->styles[style] < 64) {
+					dynamic = true;
+					break;
+				}
+			}
+		}
+		world->surfaces[i].lightmapDynamic = dynamic;
+
 		// Create the lightmap texture for this surface
 		BuildLightmap(world, i, lightWidth, lightHeight);
 	}
@@ -276,17 +396,23 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 {
 	// Loop through all the visible surfaces and draw them
 	for (int i = 0; i < numVisibleSurfaces; i++) {
-		int surface = visibleSurfaces[i];
+		int surfaceIndex = visibleSurfaces[i];
+		Surface *surface = &world->surfaces[surfaceIndex];
+		// If the lightmap is dynamic, rebuild it with the current style values
+		if (surface->lightmapDynamic && surface->lightmapFrame != world->lightStyleFrame) {
+			RebuildLightmap(world, surfaceIndex);
+			surface->lightmapFrame = world->lightStyleFrame;
+		}
 		// Get a pointer to the texture info so we know which base texture to bind
-		texinfo_t *textureInfo = world->map.getTextureInfo(surface);
+		texinfo_t *textureInfo = world->map.getTextureInfo(surfaceIndex);
 		Texture *texture = &world->textures[textureInfo->miptex];
 		// Bind the base texture to unit 0 and the surface's lightmap to unit 1
 		glActiveTextureFn(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texture->objName);
 		glActiveTextureFn(GL_TEXTURE1);
-		glBindTexture(GL_TEXTURE_2D, world->surfaces[surface].lightmapObjName);
+		glBindTexture(GL_TEXTURE_2D, surface->lightmapObjName);
 		// Draw the surface
-		DrawSurface(world, surface);
+		DrawSurface(world, surfaceIndex);
 
 		// If the texture has luma/fullbright pixels, draw a second pass
 		if (texture->hasLuma) {
@@ -303,7 +429,7 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 			glBindTexture(GL_TEXTURE_2D, texture->lumaObjName);
 
 			// Draw the surface again
-			DrawSurface(world, surface);
+			DrawSurface(world, surfaceIndex);
 
 			// Restore state
 			glDisable(GL_ALPHA_TEST);
@@ -430,6 +556,8 @@ void DEMO_Initialize(void)
 		RETRO_RageQuit("Unable to initialize world surfaces\n");
 	}
 
+	UpdateLightStyles(&world, 0.0);
+
 	// Configure the lightmap texture unit (1) to modulate the base texture on unit 0.
 	// GL_COMBINE with an RGB scale of 2 applies "overbright" lighting so lit surfaces are
 	// not too dark; the combine defaults already multiply this unit's lightmap texel by the
@@ -528,6 +656,9 @@ void DEMO_Render(double deltatime)
 			camera.origin[1] + camera.forward[1],
 			camera.origin[2] + camera.forward[2],
 			camera.up[0], camera.up[1], camera.up[2]);
+
+	// Advance the clock that drives light style animation
+	UpdateLightStyles(&world, deltatime);
 
 	// Find the leaf the camera is in
 	dleaf_t *leaf = FindCameraLeaf(&world, &camera);

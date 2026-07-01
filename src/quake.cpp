@@ -16,7 +16,9 @@
 // Everything derived from one BSP texture: its OpenGL objects and classification flags
 struct Texture
 {
-	unsigned int objName = 0;	// OpenGL texture object name
+	unsigned int objName = 0;		// OpenGL texture object name
+	unsigned int lumaObjName = 0;	// OpenGL luma (fullbright overlay) texture object name
+	bool hasLuma = false;			// True if texture has fullbright pixels
 };
 
 // Everything derived from one BSP surface (face): its vertices' lightmap and lighting state
@@ -40,6 +42,11 @@ struct World
 World world;
 RETRO_Camera camera;
 
+static unsigned int PaletteRGBA(World *world, unsigned char color, unsigned char alpha = 255)
+{
+	return (world->map.palette[color] & 0x00ffffff) | ((unsigned int)alpha << 24);
+}
+
 //
 // Create one OpenGL texture object per BSP texture and upload mipmapped RGBA data
 //
@@ -50,7 +57,11 @@ bool UploadTextures(World *world)
 	for (int i = 0; i < world->numTextures; i++) {
 		Texture *texture = &world->textures[i];
 
-		glGenTextures(1, &texture->objName);
+		unsigned int names[2];
+		glGenTextures(2, names);
+		texture->objName = names[0];
+		texture->lumaObjName = names[1];
+
 		glBindTexture(GL_TEXTURE_2D, texture->objName);
 
 		// Point to the stored mipmaps
@@ -68,14 +79,24 @@ bool UploadTextures(World *world)
 		int width = mipTexture->width;
 		int height = mipTexture->height;
 		unsigned int *pixels = new unsigned int [width * height];
+		unsigned int *lumaPixels = new unsigned int [width * height];
 
+		bool hasLuma = false;
 		// Point to the raw 8-bit texture data (the full-resolution mip level)
 		unsigned char *rawTexture = (unsigned char *)mipTexture + mipTexture->offsets[0];
 		for (int x = 0; x < width; x++) {
 			for (int y = 0; y < height; y++) {
-				pixels[x + y * width] = world->map.palette[rawTexture[x + y * width]];
+				unsigned char colorIndex = rawTexture[x + y * width];
+				pixels[x + y * width] = world->map.palette[colorIndex];
+				if (colorIndex >= 224) {
+					hasLuma = true;
+					lumaPixels[x + y * width] = PaletteRGBA(world, colorIndex, 255);
+				} else {
+					lumaPixels[x + y * width] = 0x00000000;
+				}
 			}
 		}
+		texture->hasLuma = hasLuma;
 
 		// Create mipmaps from the created texture
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
@@ -83,6 +104,14 @@ bool UploadTextures(World *world)
 		gluBuild2DMipmaps(GL_TEXTURE_2D, 4, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 
 		delete[] pixels;
+
+		if (hasLuma) {
+			glBindTexture(GL_TEXTURE_2D, texture->lumaObjName);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			gluBuild2DMipmaps(GL_TEXTURE_2D, 4, width, height, GL_RGBA, GL_UNSIGNED_BYTE, lumaPixels);
+		}
+		delete[] lumaPixels;
 	}
 
 	return true;
@@ -250,13 +279,38 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 		int surface = visibleSurfaces[i];
 		// Get a pointer to the texture info so we know which base texture to bind
 		texinfo_t *textureInfo = world->map.getTextureInfo(surface);
+		Texture *texture = &world->textures[textureInfo->miptex];
 		// Bind the base texture to unit 0 and the surface's lightmap to unit 1
 		glActiveTextureFn(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, world->textures[textureInfo->miptex].objName);
+		glBindTexture(GL_TEXTURE_2D, texture->objName);
 		glActiveTextureFn(GL_TEXTURE1);
 		glBindTexture(GL_TEXTURE_2D, world->surfaces[surface].lightmapObjName);
 		// Draw the surface
 		DrawSurface(world, surface);
+
+		// If the texture has luma/fullbright pixels, draw a second pass
+		if (texture->hasLuma) {
+			// Disable multitexturing
+			glActiveTextureFn(GL_TEXTURE1);
+			glDisable(GL_TEXTURE_2D);
+
+			// Enable alpha test
+			glEnable(GL_ALPHA_TEST);
+			glAlphaFunc(GL_GREATER, 0.0f);
+
+			// Bind luma texture to unit 0
+			glActiveTextureFn(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, texture->lumaObjName);
+
+			// Draw the surface again
+			DrawSurface(world, surface);
+
+			// Restore state
+			glDisable(GL_ALPHA_TEST);
+			glActiveTextureFn(GL_TEXTURE1);
+			glEnable(GL_TEXTURE_2D);
+			glActiveTextureFn(GL_TEXTURE0);
+		}
 	}
 }
 
@@ -398,6 +452,7 @@ void DEMO_Deinitialize(void)
 	if (world.textures) {
 		for (int i = 0; i < world.numTextures; i++) {
 			glDeleteTextures(1, &world.textures[i].objName);
+			glDeleteTextures(1, &world.textures[i].lumaObjName);
 		}
 		delete[] world.textures;
 		world.textures = NULL;

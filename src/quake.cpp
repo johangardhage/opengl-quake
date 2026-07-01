@@ -15,10 +15,75 @@
 struct World
 {
 	RETRO_BSP map;							// The loaded map (BSP, palette and colormap), owned by value
+
+	primdesc_t *surfacePrimitives = NULL;	// Array of surface primitives, contains vertex information for every surface
+	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 };
 
 World world;
 RETRO_Camera camera;
+
+//
+// Build per-surface primitive vertices
+//
+bool BuildSurfacePrimitives(World *world)
+{
+	// Calculate max number of edges per surface
+	world->numMaxEdgesPerSurface = 0;
+	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+		if (world->numMaxEdgesPerSurface < world->map.getNumEdges(i)) {
+			world->numMaxEdgesPerSurface = world->map.getNumEdges(i);
+		}
+	}
+
+	// Allocate memory for the surface primitive array
+	world->surfacePrimitives = new primdesc_t [world->map.getNumSurfaces() * world->numMaxEdgesPerSurface];
+
+	// Loop through all the surfaces to fetch the vertices
+	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+		int numEdges = world->map.getNumEdges(i);
+
+		// Point to a surface primitive array
+		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+
+		for (int j = 0; j < numEdges; j++, primitives++) {
+			// Get an edge id from the surface. Fetch the correct edge by using the id in the Edge List.
+			// The winding is backwards!
+			int edgeId = world->map.getEdgeList(world->map.getSurface(i)->firstedge + (numEdges - 1 - j));
+			// Positive surfedge -> edge used forwards (start vertex); otherwise reversed (end vertex)
+			int vertexId = ((edgeId >= 0) ? world->map.getEdge(edgeId)->v[0] : world->map.getEdge(-edgeId)->v[1]);
+
+			// Store the vertex in the primitive array
+			vec3_t *vertex = world->map.getVertex(vertexId);
+			primitives->v[0] = ((float *)vertex)[0];
+			primitives->v[1] = ((float *)vertex)[1];
+			primitives->v[2] = ((float *)vertex)[2];
+		}
+	}
+
+	return true;
+}
+
+//
+// Draw the surface
+//
+void DrawSurface(World *world, int surface)
+{
+	// Get the surface primitive
+	primdesc_t *primitives = &world->surfacePrimitives[world->numMaxEdgesPerSurface * surface];
+
+	// Give each surface a deterministic flat colour derived from its index
+	unsigned int hash = (unsigned int)surface * 1103515245u + 12345u;
+	glColor3ub(hash & 0xff, (hash >> 8) & 0xff, (hash >> 16) & 0xff);
+
+	// Loop through all vertices of the primitive and draw a surface. BSP faces are
+	// convex, so a triangle fan from the first vertex fills the whole face.
+	glBegin(GL_TRIANGLE_FAN);
+	for (int i = 0; i < world->map.getNumEdges(surface); i++, primitives++) {
+		glVertex3fv(primitives->v);
+	}
+	glEnd();
+}
 
 void DEMO_Startup(void)
 {
@@ -37,6 +102,11 @@ void DEMO_Initialize(void)
 		RETRO_RageQuit("Unable to load BSP\n");
 	}
 
+	// Build the world from the map
+	if (!BuildSurfacePrimitives(&world)) {
+		RETRO_RageQuit("Unable to initialize world surfaces\n");
+	}
+
 	// Set the camera's starting position
 	camera.SetPosition(540.0f, 260.0f, 100.0f);
 	camera.SetOrientation(90.0f, 0.0f);
@@ -46,6 +116,7 @@ void DEMO_Initialize(void)
 
 void DEMO_Deinitialize(void)
 {
+	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
 	RETRO_FreeBSP(&world.map);
 }
 
@@ -111,10 +182,8 @@ void DEMO_Render(double deltatime)
 
 	// Render the scene
 	glDisable(GL_TEXTURE_2D);
-	glBegin(GL_POINTS);
-	for (int i = 0; i < world.map.getLump(LUMP_VERTEXES)->filelen / sizeof(dvertex_t); i++) {
-		glVertex3fv((float *)world.map.getVertex(i));
+	for (int i = 0; i < world.map.getNumSurfaces(); i++) {
+		DrawSurface(&world, i);
 	}
-	glEnd();
 	glEnable(GL_TEXTURE_2D);
 }

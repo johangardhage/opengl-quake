@@ -9,6 +9,7 @@
 #include "lib/retrobsp.h"
 #include "lib/retromath.h"
 #include "lib/retrocamera.h"
+#include <float.h>
 
 #define MOVEMENT_SPEED 5.0
 
@@ -18,12 +19,19 @@ struct Texture
 	unsigned int objName = 0;	// OpenGL texture object name
 };
 
+// Everything derived from one BSP surface (face): its vertices' lightmap and lighting state
+struct Surface
+{
+	unsigned int lightmapObjName = 0;	// OpenGL lightmap texture object name
+};
+
 struct World
 {
 	RETRO_BSP map;							// The loaded map (BSP, palette and colormap), owned by value
 
-	primdesc_t *surfacePrimitives = NULL;	// Array of surface primitives, contains vertex information for every surface
+	primdesc_t *surfacePrimitives = NULL;	// Array of surface primitives, contains vertex, texture and lightmap information for every surface
 	Texture *textures = NULL;				// Array of per-BSP-texture OpenGL state, one per BSP texture
+	Surface *surfaces = NULL;				// Array of per-surface OpenGL state, one per surface
 	int *visibleSurfaces = NULL;			// Array of visible surfaces, contains an index to the surfaces
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	int numTextures = 0;					// Number of OpenGL texture objects
@@ -81,26 +89,71 @@ bool UploadTextures(World *world)
 }
 
 //
-// Build per-surface primitive vertices
+// Create an OpenGL lightmap texture for a single surface. Sky and liquid surfaces
+// (TEX_SPECIAL), and faces with no stored lighting, get a solid white texel so the
+// modulate pass leaves the base texture at full brightness.
+//
+void BuildLightmap(World *world, int surface, int width, int height)
+{
+	glBindTexture(GL_TEXTURE_2D, world->surfaces[surface].lightmapObjName);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	dface_t *face = world->map.getSurface(surface);
+	texinfo_t *textureInfo = world->map.getTextureInfo(surface);
+	unsigned char *samples = world->map.getLightmap(face->lightofs);
+
+	if ((textureInfo->flags & TEX_SPECIAL) || !samples) {
+		unsigned char white = 255;
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 1, 1, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, &white);
+		return;
+	}
+
+	// Combine every light style affecting this surface into a single intensity map.
+	// Each active style contributes one width*height block of samples.
+	int size = width * height;
+	unsigned char *luxels = new unsigned char [size];
+	for (int i = 0; i < size; i++) {
+		int intensity = 0;
+		for (int style = 0; style < MAXLIGHTMAPS && face->styles[style] != 255; style++) {
+			intensity += samples[style * size + i];
+		}
+		luxels[i] = (intensity > 255) ? 255 : (unsigned char)intensity;
+	}
+
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, width, height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, luxels);
+	delete[] luxels;
+}
+
+//
+// Build per-surface primitive vertices, lightmap coordinates and lightmap textures
 //
 bool BuildSurfacePrimitives(World *world)
 {
+	int numSurfaces = world->map.getNumSurfaces();
+
 	// Allocate memory for the visible surfaces array
 	world->visibleSurfaces = new int [world->map.getNumSurfaceLists()];
 
 	// Calculate max number of edges per surface
 	world->numMaxEdgesPerSurface = 0;
-	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+	for (int i = 0; i < numSurfaces; i++) {
 		if (world->numMaxEdgesPerSurface < world->map.getNumEdges(i)) {
 			world->numMaxEdgesPerSurface = world->map.getNumEdges(i);
 		}
 	}
 
-	// Allocate memory for the surface primitive array
-	world->surfacePrimitives = new primdesc_t [world->map.getNumSurfaces() * world->numMaxEdgesPerSurface];
+	// Allocate memory for the surface primitive array and one lightmap texture per surface
+	world->surfacePrimitives = new primdesc_t [numSurfaces * world->numMaxEdgesPerSurface];
+	world->surfaces = new Surface [numSurfaces];
+	for (int i = 0; i < numSurfaces; i++) {
+		glGenTextures(1, &world->surfaces[i].lightmapObjName);
+	}
 
-	// Loop through all the surfaces to fetch the vertices
-	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+	// Loop through all the surfaces to fetch the vertices and calculate their texture and lightmap coordinates
+	for (int i = 0; i < numSurfaces; i++) {
 		int numEdges = world->map.getNumEdges(i);
 
 		// Get a pointer to texinfo for this surface
@@ -113,6 +166,9 @@ bool BuildSurfacePrimitives(World *world)
 
 		// Point to a surface primitive array
 		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+
+		// Track the surface's texture-space bounds to size its lightmap
+		float minS = FLT_MAX, minT = FLT_MAX, maxS = -FLT_MAX, maxT = -FLT_MAX;
 
 		for (int j = 0; j < numEdges; j++, primitives++) {
 			// Get an edge id from the surface. Fetch the correct edge by using the id in the Edge List.
@@ -127,10 +183,39 @@ bool BuildSurfacePrimitives(World *world)
 			primitives->v[1] = ((float *)vertex)[1];
 			primitives->v[2] = ((float *)vertex)[2];
 
-			// Calculate the vertex's texture coords and store it in the primitive array
-			primitives->t[0] = (DotProduct(textureInfo->vecs[0], primitives->v) + textureInfo->vecs[0][3]) / texWidth;
-			primitives->t[1] = (DotProduct(textureInfo->vecs[1], primitives->v) + textureInfo->vecs[1][3]) / texHeight;
+			// Project the vertex into texture space
+			float s = DotProduct(textureInfo->vecs[0], primitives->v) + textureInfo->vecs[0][3];
+			float t = DotProduct(textureInfo->vecs[1], primitives->v) + textureInfo->vecs[1][3];
+
+			// Store the normalized texture coords, and stash the raw texture-space
+			// coords in the lightmap slot until the bounds are known
+			primitives->t[0] = s / texWidth;
+			primitives->t[1] = t / texHeight;
+			primitives->l[0] = s;
+			primitives->l[1] = t;
+
+			if (s < minS) minS = s;
+			if (t < minT) minT = t;
+			if (s > maxS) maxS = s;
+			if (t > maxT) maxT = t;
 		}
+
+		// Size the lightmap from the texture-space bounds (one luxel per 16 texels)
+		int lightMinS = FloorDiv16(minS);
+		int lightMinT = FloorDiv16(minT);
+		int lightWidth = CeilDiv16(maxS) - lightMinS + 1;
+		int lightHeight = CeilDiv16(maxT) - lightMinT + 1;
+
+		// Convert the stashed texture-space coords into normalized lightmap coords,
+		// centred on the luxel (the +8 is half of the 16-texel luxel spacing)
+		primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+		for (int j = 0; j < numEdges; j++, primitives++) {
+			primitives->l[0] = (primitives->l[0] - lightMinS * 16 + 8) / (lightWidth * 16.0f);
+			primitives->l[1] = (primitives->l[1] - lightMinT * 16 + 8) / (lightHeight * 16.0f);
+		}
+
+		// Create the lightmap texture for this surface
+		BuildLightmap(world, i, lightWidth, lightHeight);
 	}
 
 	return true;
@@ -148,7 +233,8 @@ void DrawSurface(World *world, int surface)
 	// convex, so a triangle fan from the first vertex fills the whole face.
 	glBegin(GL_TRIANGLE_FAN);
 	for (int i = 0; i < world->map.getNumEdges(surface); i++, primitives++) {
-		glTexCoord2fv(primitives->t);
+		glMultiTexCoord2fFn(GL_TEXTURE0, primitives->t[0], primitives->t[1]);
+		glMultiTexCoord2fFn(GL_TEXTURE1, primitives->l[0], primitives->l[1]);
 		glVertex3fv(primitives->v);
 	}
 	glEnd();
@@ -161,12 +247,16 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 {
 	// Loop through all the visible surfaces and draw them
 	for (int i = 0; i < numVisibleSurfaces; i++) {
-		// Get a pointer to the texture info so we know which texture we should bind and draw
-		texinfo_t *textureInfo = world->map.getTextureInfo(visibleSurfaces[i]);
-		// Bind the previously created texture object
+		int surface = visibleSurfaces[i];
+		// Get a pointer to the texture info so we know which base texture to bind
+		texinfo_t *textureInfo = world->map.getTextureInfo(surface);
+		// Bind the base texture to unit 0 and the surface's lightmap to unit 1
+		glActiveTextureFn(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, world->textures[textureInfo->miptex].objName);
+		glActiveTextureFn(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, world->surfaces[surface].lightmapObjName);
 		// Draw the surface
-		DrawSurface(world, visibleSurfaces[i]);
+		DrawSurface(world, surface);
 	}
 }
 
@@ -273,6 +363,11 @@ void DEMO_Initialize(void)
 		RETRO_RageQuit("Unable to load BSP\n");
 	}
 
+	// Lightmapping needs the multitexture entry points the retro lib resolves at startup
+	if (!glActiveTextureFn || !glMultiTexCoord2fFn) {
+		RETRO_RageQuit("Multitexturing is not supported\n");
+	}
+
 	// Build the world from the map
 	if (!UploadTextures(&world)) {
 		RETRO_RageQuit("Unable to initialize world textures\n");
@@ -280,6 +375,16 @@ void DEMO_Initialize(void)
 	if (!BuildSurfacePrimitives(&world)) {
 		RETRO_RageQuit("Unable to initialize world surfaces\n");
 	}
+
+	// Configure the lightmap texture unit (1) to modulate the base texture on unit 0.
+	// GL_COMBINE with an RGB scale of 2 applies "overbright" lighting so lit surfaces are
+	// not too dark; the combine defaults already multiply this unit's lightmap texel by the
+	// incoming base colour from unit 0.
+	glActiveTextureFn(GL_TEXTURE1);
+	glEnable(GL_TEXTURE_2D);
+	glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+	glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 2.0f);
+	glActiveTextureFn(GL_TEXTURE0);
 
 	// Set the camera's starting position
 	camera.SetPosition(540.0f, 260.0f, 100.0f);
@@ -296,6 +401,13 @@ void DEMO_Deinitialize(void)
 		}
 		delete[] world.textures;
 		world.textures = NULL;
+	}
+	if (world.surfaces) {
+		for (int i = 0; i < world.map.getNumSurfaces(); i++) {
+			glDeleteTextures(1, &world.surfaces[i].lightmapObjName);
+		}
+		delete[] world.surfaces;
+		world.surfaces = NULL;
 	}
 	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
 	if (world.visibleSurfaces) delete[] world.visibleSurfaces;

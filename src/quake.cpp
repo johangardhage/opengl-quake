@@ -12,17 +12,73 @@
 
 #define MOVEMENT_SPEED 5.0
 
+// Everything derived from one BSP texture: its OpenGL objects and classification flags
+struct Texture
+{
+	unsigned int objName = 0;	// OpenGL texture object name
+};
+
 struct World
 {
 	RETRO_BSP map;							// The loaded map (BSP, palette and colormap), owned by value
 
 	primdesc_t *surfacePrimitives = NULL;	// Array of surface primitives, contains vertex information for every surface
+	Texture *textures = NULL;				// Array of per-BSP-texture OpenGL state, one per BSP texture
 	int *visibleSurfaces = NULL;			// Array of visible surfaces, contains an index to the surfaces
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
+	int numTextures = 0;					// Number of OpenGL texture objects
 };
 
 World world;
 RETRO_Camera camera;
+
+//
+// Create one OpenGL texture object per BSP texture and upload mipmapped RGBA data
+//
+bool UploadTextures(World *world)
+{
+	world->numTextures = world->map.getNumTextures();
+	world->textures = new Texture [world->numTextures];
+	for (int i = 0; i < world->numTextures; i++) {
+		Texture *texture = &world->textures[i];
+
+		glGenTextures(1, &texture->objName);
+		glBindTexture(GL_TEXTURE_2D, texture->objName);
+
+		// Point to the stored mipmaps
+		miptex_t *mipTexture = world->map.getMipTexture(i);
+
+		// NULL textures exist, fill their object with a fallback texel.
+		if (!mipTexture || !mipTexture->name[0] || mipTexture->offsets[0] == 0) {
+			unsigned int filler = 0xFF000000;
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			gluBuild2DMipmaps(GL_TEXTURE_2D, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &filler);
+			continue;
+		}
+
+		int width = mipTexture->width;
+		int height = mipTexture->height;
+		unsigned int *pixels = new unsigned int [width * height];
+
+		// Point to the raw 8-bit texture data (the full-resolution mip level)
+		unsigned char *rawTexture = (unsigned char *)mipTexture + mipTexture->offsets[0];
+		for (int x = 0; x < width; x++) {
+			for (int y = 0; y < height; y++) {
+				pixels[x + y * width] = world->map.palette[rawTexture[x + y * width]];
+			}
+		}
+
+		// Create mipmaps from the created texture
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		gluBuild2DMipmaps(GL_TEXTURE_2D, 4, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+		delete[] pixels;
+	}
+
+	return true;
+}
 
 //
 // Build per-surface primitive vertices
@@ -47,6 +103,14 @@ bool BuildSurfacePrimitives(World *world)
 	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
 		int numEdges = world->map.getNumEdges(i);
 
+		// Get a pointer to texinfo for this surface
+		texinfo_t *textureInfo = world->map.getTextureInfo(i);
+		// Get a pointer to the surface's miptextures (missing texture slots return NULL)
+		miptex_t *mipTexture = world->map.getMipTexture(textureInfo->miptex);
+		// Fall back to a unit size when the texture slot has no data (missing texture)
+		float texWidth = (mipTexture && mipTexture->width) ? (float)mipTexture->width : 1.0f;
+		float texHeight = (mipTexture && mipTexture->height) ? (float)mipTexture->height : 1.0f;
+
 		// Point to a surface primitive array
 		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
 
@@ -62,6 +126,10 @@ bool BuildSurfacePrimitives(World *world)
 			primitives->v[0] = ((float *)vertex)[0];
 			primitives->v[1] = ((float *)vertex)[1];
 			primitives->v[2] = ((float *)vertex)[2];
+
+			// Calculate the vertex's texture coords and store it in the primitive array
+			primitives->t[0] = (DotProduct(textureInfo->vecs[0], primitives->v) + textureInfo->vecs[0][3]) / texWidth;
+			primitives->t[1] = (DotProduct(textureInfo->vecs[1], primitives->v) + textureInfo->vecs[1][3]) / texHeight;
 		}
 	}
 
@@ -76,14 +144,11 @@ void DrawSurface(World *world, int surface)
 	// Get the surface primitive
 	primdesc_t *primitives = &world->surfacePrimitives[world->numMaxEdgesPerSurface * surface];
 
-	// Give each surface a deterministic flat colour derived from its index
-	unsigned int hash = (unsigned int)surface * 1103515245u + 12345u;
-	glColor3ub(hash & 0xff, (hash >> 8) & 0xff, (hash >> 16) & 0xff);
-
 	// Loop through all vertices of the primitive and draw a surface. BSP faces are
 	// convex, so a triangle fan from the first vertex fills the whole face.
 	glBegin(GL_TRIANGLE_FAN);
 	for (int i = 0; i < world->map.getNumEdges(surface); i++, primitives++) {
+		glTexCoord2fv(primitives->t);
 		glVertex3fv(primitives->v);
 	}
 	glEnd();
@@ -96,6 +161,11 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 {
 	// Loop through all the visible surfaces and draw them
 	for (int i = 0; i < numVisibleSurfaces; i++) {
+		// Get a pointer to the texture info so we know which texture we should bind and draw
+		texinfo_t *textureInfo = world->map.getTextureInfo(visibleSurfaces[i]);
+		// Bind the previously created texture object
+		glBindTexture(GL_TEXTURE_2D, world->textures[textureInfo->miptex].objName);
+		// Draw the surface
 		DrawSurface(world, visibleSurfaces[i]);
 	}
 }
@@ -204,6 +274,9 @@ void DEMO_Initialize(void)
 	}
 
 	// Build the world from the map
+	if (!UploadTextures(&world)) {
+		RETRO_RageQuit("Unable to initialize world textures\n");
+	}
 	if (!BuildSurfacePrimitives(&world)) {
 		RETRO_RageQuit("Unable to initialize world surfaces\n");
 	}
@@ -217,6 +290,13 @@ void DEMO_Initialize(void)
 
 void DEMO_Deinitialize(void)
 {
+	if (world.textures) {
+		for (int i = 0; i < world.numTextures; i++) {
+			glDeleteTextures(1, &world.textures[i].objName);
+		}
+		delete[] world.textures;
+		world.textures = NULL;
+	}
 	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
 	if (world.visibleSurfaces) delete[] world.visibleSurfaces;
 	RETRO_FreeBSP(&world.map);
@@ -286,7 +366,5 @@ void DEMO_Render(double deltatime)
 	dleaf_t *leaf = FindCameraLeaf(&world, &camera);
 
 	// Render the scene
-	glDisable(GL_TEXTURE_2D);
 	DrawVisibleSet(&world, leaf);
-	glEnable(GL_TEXTURE_2D);
 }

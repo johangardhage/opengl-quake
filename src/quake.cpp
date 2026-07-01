@@ -13,6 +13,14 @@
 
 #define MOVEMENT_SPEED 5.0
 
+// Liquid surfaces ripple their texture coordinates; sky surfaces use Quake's
+// two-layer sky projection.
+#define WARP_SPACE_FREQ 6.28f	// ripple cycles per texture repeat
+#define WARP_TIME_FREQ 2.0f		// ripple speed
+#define WARP_AMPLITUDE 0.0625f	// ripple depth in texture-coordinate space
+#define SKY_BACK_SCROLL_SPEED 8.0f	// sky back layer texels per second
+#define SKY_FRONT_SCROLL_SPEED 16.0f	// sky cloud layer texels per second
+
 // The "+0".."+N" animation sequence of a texture, owned by its "+0" frame
 struct TextureAnim
 {
@@ -23,10 +31,16 @@ struct TextureAnim
 // Everything derived from one BSP texture: its OpenGL objects and classification flags
 struct Texture
 {
-	unsigned int objName = 0;		// OpenGL texture object name
-	unsigned int lumaObjName = 0;	// OpenGL luma (fullbright overlay) texture object name
-	TextureAnim anim;				// "+0".."+N" animation sequence
-	bool hasLuma = false;			// True if texture has fullbright pixels
+	unsigned int objName = 0;			// OpenGL texture object name
+	unsigned int lumaObjName = 0;		// OpenGL luma (fullbright overlay) texture object name
+	unsigned int skyBackObjName = 0;	// OpenGL sky back-layer texture object name
+	unsigned int skyFrontObjName = 0;	// OpenGL sky cloud-layer texture object name
+	TextureAnim anim;					// "+0".."+N" animation sequence
+	bool sky = false;					// True if this is a sky texture
+	bool turbulent = false;				// True if this is a liquid (turbulent) texture
+	bool hasLuma = false;				// True if texture has fullbright pixels
+	int skyLayerWidth = 0;				// Sky layer width
+	int skyLayerHeight = 0;				// Sky layer height
 };
 
 // Everything derived from one BSP surface (face): its vertices' lightmap and lighting state
@@ -52,6 +66,7 @@ struct World
 	double lightStyleTime = 0.0;			// Time accumulator for light styles
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	int numTextures = 0;					// Number of OpenGL texture objects
+	int skyTextureIndex = -1;				// BSP texture used for the continuous sky background
 	double textureTime = 0.0;				// Accumulated time driving texture animation
 };
 
@@ -64,19 +79,96 @@ static unsigned int PaletteRGBA(World *world, unsigned char color, unsigned char
 }
 
 //
+// True if the texture name begins with "sky" (case-insensitive)
+//
+bool IsSkyTextureName(const char *name)
+{
+	if (!name) {
+		return false;
+	}
+	char c0 = name[0];
+	char c1 = name[1];
+	char c2 = name[2];
+	if (c0 >= 'A' && c0 <= 'Z') c0 += 'a' - 'A';
+	if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
+	if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
+	return c0 == 's' && c1 == 'k' && c2 == 'y';
+}
+
+//
+// True if the texture is a liquid (Quake names liquids "*...")
+//
+bool IsTurbulentTextureName(const char *name)
+{
+	return name && name[0] == '*';
+}
+
+void UploadSkyLayer(unsigned int textureObj, int width, int height, unsigned int *texture)
+{
+	glBindTexture(GL_TEXTURE_2D, textureObj);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+	gluBuild2DMipmaps(GL_TEXTURE_2D, 4, width, height, GL_RGBA, GL_UNSIGNED_BYTE, texture);
+}
+
+//
+// Quake sky textures are usually 256x128: the left half is an alpha-tested cloud
+// layer and the right half is the solid back layer.
+//
+void UploadSkyTextures(World *world, int textureIndex, miptex_t *mipTexture)
+{
+	Texture *texture = &world->textures[textureIndex];
+
+	int width = mipTexture->width;
+	int height = mipTexture->height;
+	int layerWidth = (width >= 2) ? width / 2 : width;
+	bool hasCloudLayer = (layerWidth * 2 <= width);
+	int backOffset = hasCloudLayer ? layerWidth : 0;
+
+	texture->skyLayerWidth = layerWidth;
+	texture->skyLayerHeight = height;
+
+	unsigned int *backLayer = new unsigned int [layerWidth * height];
+	unsigned int *frontLayer = new unsigned int [layerWidth * height];
+	unsigned char *rawTexture = (unsigned char *)mipTexture + mipTexture->offsets[0];
+
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < layerWidth; x++) {
+			unsigned char backColor = rawTexture[(x + backOffset) + y * width];
+			backLayer[x + y * layerWidth] = PaletteRGBA(world, backColor);
+
+			unsigned char frontColor = hasCloudLayer ? rawTexture[x + y * width] : 0;
+			unsigned char alpha = (hasCloudLayer && frontColor != 0) ? 255 : 0;
+			frontLayer[x + y * layerWidth] = PaletteRGBA(world, frontColor, alpha);
+		}
+	}
+
+	UploadSkyLayer(texture->skyBackObjName, layerWidth, height, backLayer);
+	UploadSkyLayer(texture->skyFrontObjName, layerWidth, height, frontLayer);
+
+	delete[] backLayer;
+	delete[] frontLayer;
+}
+
+//
 // Create one OpenGL texture object per BSP texture and upload mipmapped RGBA data
 //
 bool UploadTextures(World *world)
 {
 	world->numTextures = world->map.getNumTextures();
 	world->textures = new Texture [world->numTextures];
+
 	for (int i = 0; i < world->numTextures; i++) {
 		Texture *texture = &world->textures[i];
 
-		unsigned int names[2];
-		glGenTextures(2, names);
+		unsigned int names[4];
+		glGenTextures(4, names);
 		texture->objName = names[0];
 		texture->lumaObjName = names[1];
+		texture->skyBackObjName = names[2];
+		texture->skyFrontObjName = names[3];
 
 		glBindTexture(GL_TEXTURE_2D, texture->objName);
 
@@ -96,6 +188,8 @@ bool UploadTextures(World *world)
 		int height = mipTexture->height;
 		unsigned int *pixels = new unsigned int [width * height];
 		unsigned int *lumaPixels = new unsigned int [width * height];
+		texture->sky = IsSkyTextureName(mipTexture->name);
+		texture->turbulent = IsTurbulentTextureName(mipTexture->name);
 
 		bool hasLuma = false;
 		// Point to the raw 8-bit texture data (the full-resolution mip level)
@@ -103,7 +197,7 @@ bool UploadTextures(World *world)
 		for (int x = 0; x < width; x++) {
 			for (int y = 0; y < height; y++) {
 				unsigned char colorIndex = rawTexture[x + y * width];
-				pixels[x + y * width] = world->map.palette[colorIndex];
+				pixels[x + y * width] = PaletteRGBA(world, colorIndex);
 				if (colorIndex >= 224) {
 					hasLuma = true;
 					lumaPixels[x + y * width] = PaletteRGBA(world, colorIndex, 255);
@@ -128,6 +222,13 @@ bool UploadTextures(World *world)
 			gluBuild2DMipmaps(GL_TEXTURE_2D, 4, width, height, GL_RGBA, GL_UNSIGNED_BYTE, lumaPixels);
 		}
 		delete[] lumaPixels;
+
+		if (texture->sky) {
+			UploadSkyTextures(world, i, mipTexture);
+			if (world->skyTextureIndex < 0) {
+				world->skyTextureIndex = i;
+			}
+		}
 	}
 
 	return true;
@@ -476,6 +577,97 @@ bool BuildSurfacePrimitives(World *world)
 	return true;
 }
 
+void SkyTexCoord(World *world, int textureIndex, const float dir[3], float scroll, float *s, float *t)
+{
+	float skyDir[3] = {
+		dir[0],
+		dir[1],
+		dir[2] * 3.0f
+	};
+	float length = sqrtf(skyDir[0] * skyDir[0] + skyDir[1] * skyDir[1] + skyDir[2] * skyDir[2]);
+	if (length < 0.0001f) {
+		length = 0.0001f;
+	}
+
+	Texture *texture = &world->textures[textureIndex];
+	int width = texture->skyLayerWidth > 0 ? texture->skyLayerWidth : 128;
+	int height = texture->skyLayerHeight > 0 ? texture->skyLayerHeight : 128;
+	float scale = (6.0f * 63.0f) / length;
+	*s = (scroll + skyDir[0] * scale) / (float)width;
+	*t = (scroll + skyDir[1] * scale) / (float)height;
+}
+
+void DrawSkyBackgroundLayer(World *world, RETRO_Camera *camera, int textureIndex, unsigned int textureObj, float scroll)
+{
+	const int slices = 64;
+	const int stacks = 32;
+	const float radius = 2048.0f;
+
+	glBindTexture(GL_TEXTURE_2D, textureObj);
+
+	for (int stack = 0; stack < stacks; stack++) {
+		float phi0 = (-0.5f + (float)stack / (float)stacks) * (float)M_PI;
+		float phi1 = (-0.5f + (float)(stack + 1) / (float)stacks) * (float)M_PI;
+
+		glBegin(GL_QUAD_STRIP);
+		for (int slice = 0; slice <= slices; slice++) {
+			float theta = ((float)slice / (float)slices) * 2.0f * (float)M_PI;
+			float cosTheta = cosf(theta);
+			float sinTheta = sinf(theta);
+
+			float dir0[3] = { cosf(phi0) * cosTheta, cosf(phi0) * sinTheta, sinf(phi0) };
+			float dir1[3] = { cosf(phi1) * cosTheta, cosf(phi1) * sinTheta, sinf(phi1) };
+			float s, t;
+
+			SkyTexCoord(world, textureIndex, dir1, scroll, &s, &t);
+			glTexCoord2f(s, t);
+			glVertex3f(camera->origin[0] + dir1[0] * radius,
+					camera->origin[1] + dir1[1] * radius,
+					camera->origin[2] + dir1[2] * radius);
+
+			SkyTexCoord(world, textureIndex, dir0, scroll, &s, &t);
+			glTexCoord2f(s, t);
+			glVertex3f(camera->origin[0] + dir0[0] * radius,
+					camera->origin[1] + dir0[1] * radius,
+					camera->origin[2] + dir0[2] * radius);
+		}
+		glEnd();
+	}
+}
+
+void DrawSkyBackground(World *world, RETRO_Camera *camera)
+{
+	int textureIndex = world->skyTextureIndex;
+	if (textureIndex < 0 || textureIndex >= world->numTextures || world->textures[textureIndex].skyBackObjName == 0) {
+		return;
+	}
+
+	glActiveTextureFn(GL_TEXTURE1);
+	glDisable(GL_TEXTURE_2D);
+	glActiveTextureFn(GL_TEXTURE0);
+	glDisable(GL_DEPTH_TEST);
+	glDepthMask(GL_FALSE);
+	glDisable(GL_CULL_FACE);
+	glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+	glDisable(GL_BLEND);
+	DrawSkyBackgroundLayer(world, camera, textureIndex, world->textures[textureIndex].skyBackObjName,
+			(float)(world->textureTime * SKY_BACK_SCROLL_SPEED));
+
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	DrawSkyBackgroundLayer(world, camera, textureIndex, world->textures[textureIndex].skyFrontObjName,
+			(float)(world->textureTime * SKY_FRONT_SCROLL_SPEED));
+	glDisable(GL_BLEND);
+
+	glEnable(GL_CULL_FACE);
+	glDepthMask(GL_TRUE);
+	glEnable(GL_DEPTH_TEST);
+	glActiveTextureFn(GL_TEXTURE1);
+	glEnable(GL_TEXTURE_2D);
+	glActiveTextureFn(GL_TEXTURE0);
+}
+
 //
 // Draw the surface
 //
@@ -484,11 +676,23 @@ void DrawSurface(World *world, int surface)
 	// Get the surface primitive
 	primdesc_t *primitives = &world->surfacePrimitives[world->numMaxEdgesPerSurface * surface];
 
+	// Liquid surfaces ripple their texture coordinates.
+	int miptex = world->map.getTextureInfo(surface)->miptex;
+	bool turbulent = world->textures[miptex].turbulent;
+	float time = (float)world->textureTime;
+
 	// Loop through all vertices of the primitive and draw a surface. BSP faces are
 	// convex, so a triangle fan from the first vertex fills the whole face.
 	glBegin(GL_TRIANGLE_FAN);
 	for (int i = 0; i < world->map.getNumEdges(surface); i++, primitives++) {
-		glMultiTexCoord2fFn(GL_TEXTURE0, primitives->t[0], primitives->t[1]);
+		float s = primitives->t[0];
+		float t = primitives->t[1];
+		if (turbulent) {
+			// Ripple the texture coordinates with a time-varying sine
+			s = primitives->t[0] + sinf(primitives->t[1] * WARP_SPACE_FREQ + time * WARP_TIME_FREQ) * WARP_AMPLITUDE;
+			t = primitives->t[1] + sinf(primitives->t[0] * WARP_SPACE_FREQ + time * WARP_TIME_FREQ) * WARP_AMPLITUDE;
+		}
+		glMultiTexCoord2fFn(GL_TEXTURE0, s, t);
 		glMultiTexCoord2fFn(GL_TEXTURE1, primitives->l[0], primitives->l[1]);
 		glVertex3fv(primitives->v);
 	}
@@ -514,6 +718,9 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 		// Resolve animated textures to their current frame
 		int textureIndex = ResolveTextureAnimation(world, textureInfo->miptex);
 		Texture *texture = &world->textures[textureIndex];
+		if (texture->sky) {
+			continue;
+		}
 		// Bind the base texture to unit 0 and the surface's lightmap to unit 1
 		glActiveTextureFn(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, texture->objName);
@@ -690,8 +897,11 @@ void DEMO_Deinitialize(void)
 {
 	if (world.textures) {
 		for (int i = 0; i < world.numTextures; i++) {
-			glDeleteTextures(1, &world.textures[i].objName);
-			glDeleteTextures(1, &world.textures[i].lumaObjName);
+			Texture *texture = &world.textures[i];
+			glDeleteTextures(1, &texture->objName);
+			glDeleteTextures(1, &texture->lumaObjName);
+			glDeleteTextures(1, &texture->skyBackObjName);
+			glDeleteTextures(1, &texture->skyFrontObjName);
 		}
 		delete[] world.textures;
 		world.textures = NULL;
@@ -703,8 +913,8 @@ void DEMO_Deinitialize(void)
 		delete[] world.surfaces;
 		world.surfaces = NULL;
 	}
-	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
-	if (world.visibleSurfaces) delete[] world.visibleSurfaces;
+	if (world.surfacePrimitives) { delete[] world.surfacePrimitives; world.surfacePrimitives = NULL; }
+	if (world.visibleSurfaces) { delete[] world.visibleSurfaces; world.visibleSurfaces = NULL; }
 	RETRO_FreeBSP(&world.map);
 }
 
@@ -773,6 +983,10 @@ void DEMO_Render(double deltatime)
 
 	// Advance the clock that drives light style animation
 	UpdateLightStyles(&world, deltatime);
+
+	// Draw one continuous sky behind the world; BSP sky faces are skipped so they
+	// reveal this background instead of carrying their own texture projection.
+	DrawSkyBackground(&world, &camera);
 
 	// Find the leaf the camera is in
 	dleaf_t *leaf = FindCameraLeaf(&world, &camera);
